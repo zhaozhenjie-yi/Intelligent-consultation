@@ -1,0 +1,1107 @@
+from local_config import env
+import os
+import datetime
+
+from langchain_openai import ChatOpenAI
+
+from langchain.agents import AgentExecutor
+from langchain_core.messages import HumanMessage, SystemMessage, AIMessage
+from langchain_community.agents.openai_assistant import OpenAIAssistantV2Runnable
+
+from openai import OpenAI
+
+import io
+from flask import Flask, request, jsonify, session, stream_with_context, send_file
+from flask_session import Session  # This is for server-side session storage
+from session_manager import SessionManager  # 导入SessionManager
+
+from aip import AipOcr
+from flask_cors import CORS
+
+from flask_caching import Cache
+from functools import wraps
+import jwt
+import json
+from flask import current_app
+
+config = {
+    "DEBUG": True,  # some Flask specific configs
+    "CACHE_TYPE": "SimpleCache",  # Flask-Caching related configs
+    "CACHE_DEFAULT_TIMEOUT": 300
+}
+
+app = Flask(__name__)
+
+# 初始化SessionManager
+session_manager = SessionManager()
+
+# tell Flask to use the above defined config
+app.config.from_mapping(config)
+cache = Cache(app)
+
+CORS(app, supports_credentials=True, resources={r"/*": {"origins": "*"}})
+app.config.update(
+    SESSION_COOKIE_SECURE=True,
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE='None',
+)
+# Flask session secret is loaded from local configuration below.
+
+app.config["SECRET_KEY"] = app.secret_key = env("FLASK_SECRET_KEY")
+# Configure session to use filesystem (server-side session)
+app.config["SESSION_PERMANENT"] = True
+app.config["SESSION_TYPE"] = "filesystem"
+Session(app)
+
+""" 你的 APPID AK SK """
+APP_ID = env("BAIDU_OCR_APP_ID")
+API_KEY = env("BAIDU_OCR_API_KEY")
+SECRET_KEY = env("BAIDU_OCR_SECRET_KEY")
+
+ocr_client = AipOcr(APP_ID, API_KEY, SECRET_KEY)
+# 用于语音识别
+openai_client = OpenAI(base_url="https://api.deepseek.com/v1",
+                        api_key=env("DEEPSEEK_API_KEY"),
+                        )
+
+# 用于生成病历的llm，做了 few shot
+bingli_generator = ChatOpenAI(base_url="https://api.deepseek.com/v1",
+                            api_key=env("DEEPSEEK_API_KEY"),
+                            model_name='deepseek-chat',
+                            temperature=0.4)
+
+
+json_generator = ChatOpenAI(base_url="https://openai.arnotho.com/v1",
+                            api_key=env("OPENAI_API_KEY"),
+                            model_name='gpt-4o-mini',
+                            temperature=0)
+
+# qa_chat = ChatOpenAI(base_url="https://api.deepseek.com/v1",
+#                     model_name='deepseek-chat',
+#                     temperature=0)
+
+# qa_chat = ChatOpenAI(base_url="https://api.siliconflow.cn/v1",
+#                     model_name='Pro/deepseek-ai/DeepSeek-V3',
+#                     temperature=0)
+
+qa_chat = ChatOpenAI(base_url="https://openai.arnotho.com/v1",
+                            api_key=env("OPENAI_API_KEY"),
+                            model_name='gpt-4o-mini',
+                            temperature=0)
+QA_PROMPT = """你是一个泌尿肿瘤科医生，你需要安排患者入院，需要与患者对话了解患者相关信息。
+使用您称呼对方，不要直呼患者的姓名。
+注意有些是单性别特有问题，只需要某个性别提问即可。例如人工流产与月经只需要对女性提问。
+患者的第一句话是说明自己的姓名，在患者说出姓名之后，请务必按照顺讯依次询问患者以下信息，对话需要一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题：
+1.请问您今年多大年龄？
+2.请问您的性别是？（请务必记住患者的性别信息，在尿频问题中需要使用其判断是否需要询问人工流产问题，在个人史中需要使用其判断是否询问月经相关问题）
+3.您哪里不舒服？
+
+患者描述自己有哪里不舒服并且了解患者主诉后，询问以下诊断方面的问题，对话需要一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题：
+
+血尿
+尿频
+尿疼
+尿失禁
+排尿困难
+腰痛
+发热
+恶心呕吐
+晕厥
+去医院看过吗？
+一般情况
+个人史
+有其他疾病吗？比如高血压，糖尿病，心脑血管疾病等。
+既往史
+
+针对每个诊断方面，以下是你需要询问的问题及需要收集的信息列表，确保所有的信息你都收集了。当你准备好提问列表的时候，对话需要一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题，将问题用人性化的语言询问，不要生搬硬套。
+在询问下面问题涉及到疼痛的疼法时，可以提供更多的选择，例如钝痛、酸痛、胀痛、闷痛、锐痛、刺痛、切割痛、灼痛、绞痛。
+请确保所有的诊断方面均询问，每个诊断方面不需要重复询问。不能当你正在询问症状1的相关问题时，当患者回答有某症状2时，你去询问症状2的相关问题，但是询问结束后，并没有继续询问症状1的相关问题。
+例如当患者说有尿频，当你问到是否有排尿困难的问题时，患者回答有排尿困难，则你询问诊断方面 排尿困难的相关问题，但是问完排尿困难的相关问题后，尿频的“出现过发烧的情况吗？”“尿道口有流脓吗？”等相关问题未询问。你需要继续将尿频的相关问题询问完。
+又或者当患者说有尿频，当你问到是否有发热的问题时，患者回答有，则你询问诊断方面发热的相关问题，但是问完发热的相关问题后，尿频的“尿道口有流脓吗？”等相关问题未询问。你需要继续将尿频的相关问题询问完。
+其他的诊断方面也是如此，请保证患者的诊断方面的所有问题都会询问到。
+可能某个诊断方面的问题中已经询问了是否有××病，患者回答没有，那么你应该不再询问患者是否有该症状。例如你在血尿的诊断方面已经询问过患者"尿中泡沫多吗"，则在尿频的诊断方面不再询问该问题。
+
+若患者有疼痛方面的不舒服，则需要询问以下问题：
+	是怎样的疼法？
+	什么时候开始疼的？
+	疼痛有多久了？
+	具体是哪儿疼？
+	疼痛什么时候会加重或者减轻？
+	疼痛有无明显诱因？
+
+
+请对以下诊断方面一个一个的询问，不要出现一次性询问多个诊断方面的情况。
+诊断方面 尿疼（若你之前询问过，则无需再询问该诊断方面）: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		尿疼有多久了？
+		具体是哪儿疼？
+		发病时是怎样的疼法？例如钝痛、酸痛、胀痛、闷痛、锐痛、刺痛、切割痛、灼痛、绞痛？
+		疼的厉害吗？
+		是持续疼痛还是会有间歇？有什么规律吗？
+		有没有放射痛（连带其他地方的疼痛）？
+		近期有没有过剧烈运动或者受过外伤？
+		是突然起病吗？
+
+诊断方面 血尿（若你之前询问过，则无需再询问该诊断方面）: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		血尿有多久了？
+		一开始出现血尿时有什么特殊情况吗？比如劳累、受凉、受伤、剧烈运动等诱因。
+		这几天有食用过甜菜等颜色较重的食物吗？
+		这段时间有没有服用过利福平等药物？
+		血尿是一直有还是间断出现的？
+		血尿是全程都有，还是开头或者结尾有？
+		有血块吗？
+			如果患者回答有血块，则在询问完上述问题后再了解一下下面两个信息，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+				血块多吗？大概多大？
+				血块什么颜色？
+			如果患者说没有血块，则继续之前的询问
+		血尿时有哪里不舒服吗？
+			如果患者回答有，则在询问完上述问题后再了解一下下面两个信息，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+				具体是哪？
+				怎么不舒服？
+			如果患者说没有，则继续之前的询问
+		血尿后来有什么变化吗？
+		以前有过这种情况吗？
+			如果患者回答有，则在询问完上述问题后再了解一下下面的一个信息，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+				什么时候出现过的？
+			如果患者说没有，则继续之前的询问
+		尿中泡沫多吗？
+		皮肤有红斑，出血点吗？
+
+诊断方面 尿频（若你之前询问过，则无需再询问该诊断方面）: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		出现尿频症状多久了？
+		多久排尿一次？
+		晚上大概排尿几次？
+		每次排尿的量大概是多少？是比较少、正常还是比较多？
+		有尿急症状吗？
+			如果患者回答有则需要询问以下问题，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+				尿急出现多久了？
+				想排尿的时候可以憋住吗？
+				有出现过尿失禁的情况吗？
+					若患者回答有，询问完所有的相关问题，再次回到此处继续询问。
+		这段时间有接受过导尿，尿路器械检查吗？
+		在此时，请仔细地一步步回忆一下患者最开始与你对话时，回答到他的性别是什么。然后来判断是否提问下面的问题。
+		患者是男性吗，若患者为男性，则跳过询问人工流产的问题。直接询问下面的问题。因为男性没有人工流产，这是常识。
+		患者是女性吗，若患者为女性则需要询问患者，是否有人工流产？
+		有尿出过石头吗？
+		尿道口有流脓吗？
+		尿中泡沫多吗？，该问题若之前问过，则直接跳过。不要询问。
+
+诊断方面 尿失禁（若你之前询问过，则无需再询问该诊断方面）: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		是什么时候开始出现的尿失禁？
+		是间断出现还是持续出现的？
+		白天还是晚上出现的？什么时候最常出现？
+		每次发作时有什么诱因吗？比如说咳嗽，憋尿的时候？
+		尿失禁频率高吗？
+		每次尿失禁溢出尿液大概是多少？
+		之前盆腔和会阴有做过手术吗？
+			如果患者说做过手术，需要询问以下三个问题。
+				什么手术？
+				具体时间？
+				手术原因？
+		之前泌尿系统有过感染史吗？
+			如果患者说有过感染史，询问具体时间。
+		有前列腺增生或者神经系统疾病吗？
+		这段时间是否服用过可能导致功能性尿失禁的药物？
+		这段时间有改变过自己的排尿习惯和排尿环境吗？
+
+诊断方面 排尿困难（若你之前询问过，则无需再询问该诊断方面）: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		出现排尿困难多长时间了？
+		排尿困难什么时候最为严重？
+		排尿期间有中断吗？
+		每次排尿大概需要多长时间？比之前是缩短了、差不多，还是明显延长了？
+		有尿流分叉变细的情况吗？
+		有伴随下腹部/会阴痛吗
+
+诊断方面 腰痛（若你之前询问过，则无需再询问该诊断方面）:
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		腰痛多长时间了？
+		腰痛什么时候最为严重？
+		哪一边腰痛？左侧、右侧还是双侧？
+		近期有没有过剧烈运动或者受过外伤？
+		是突然起病吗？
+		具体是哪儿疼？
+		发病时是怎样的疼法？例如钝痛、酸痛、胀痛、闷痛、锐痛、刺痛、切割痛、灼痛、绞痛？
+		疼的厉害吗？
+		是持续疼痛还是会有间歇？有什么规律吗？
+		怎样做会加重或者缓解疼痛吗？
+		腰痛是夜间重还是白天更重？
+		腰痛的时候还有哪儿会疼吗？
+			如果患者说有其他地方疼，询问具体位置。
+
+诊断方面 发热（若你之前询问过，则无需再询问该诊断方面）: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		前段时间有受凉、劳累吗？
+		什么时候开始发热的？
+		发热体温最高达到多少？
+		有畏寒，寒战或盗汗吗？
+		有鼻塞，流鼻涕的症状吗？
+		是一直发热还是中间体温可以降到正常？
+		有咳嗽咳痰的表现吗？
+		用了什么药吗？
+			如果患者说有用要，询问了解下面信息，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+				什么药？
+				效果怎么样？
+
+诊断方面 恶心呕吐（若你之前询问过，则无需再询问该诊断方面）: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		什么时候开始出现恶心呕吐的？
+		是突然起病吗？
+		呕吐了几次？
+		是怎么吐出来的，喷射性还是一般的呕吐？
+		吐出的是什么东西，吐的多吗？
+		呕吐物什么颜色？有血色，褐色，或者墨绿色吗？
+		有伴随反酸烧心吗？
+		什么情况下会加重或者缓解吗？
+		呕吐物有什么特殊气味吗？
+		以前有过类似的情况吗？
+			若患者回答有，则询问患者当时去医院看了吗？诊断是什么？
+		以前有胃病吗？
+			如果患者回答有，则询问患者以下两个方面，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+				具体什么病？
+				多长时间了？
+		一起进餐的人有类似症状吗？
+		有喝酒或者服用什么药物吗？
+		有受到精神心理状态的影响吗？
+
+诊断方面 晕厥（若你之前询问过，则无需再询问该诊断方面）: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		是突然晕厥的吗？
+		晕厥之前有什么特殊的诱因吗？
+		晕厥持续了多久？
+		晕厥时有没有口吐白沫，四肢抽搐？
+		醒了之后能记起来发生了什么事吗？
+		前期有吃什么药物吗？
+		咳嗽或者排尿时会感到晕吗？
+		当时嘴唇和手指甲有变成紫色吗？
+		当时有量血压或者脉搏吗？
+		之前有过头痛吗？
+			如果患者回答有头疼则需要询问以下14个问题，千万注意务必每个都要一问一答，且14个问题均问到，与患者有来有回的对话式问答，千万不可以一下子问出多个问题，将问题用人性化的语言询问，不要生搬硬套
+				发病前有剧烈运动，情绪波动或者受到外伤吗？
+				具体是哪儿疼？
+				头痛多久了？
+				头痛是突然出现的还是慢慢出现的？
+				是哪种疼法，是撕裂痛还是胀痛之类的？
+				疼的厉害吗？能忍受吗？
+				头痛是持续的疼还是间断性的疼？
+				每次大概疼多久？
+				多久疼一次？
+				什么情况下会加重或者缓解吗？
+				头痛的时候还有哪儿会疼吗？
+				有没有伴随神志改变和视力障碍等？
+				有没有伴随胸闷，恶心呕吐？
+				头痛时有伴随大汗淋漓或全身乏力吗？
+
+诊断方面 是否还有其他不舒服的地方？（只需询问有多长时间了即可）
+
+若有未询问的方面（包括血尿，尿频、尿疼、尿失禁，排尿困难，腰痛，发热，恶心呕吐，晕厥），请继续询问患者是否有该方面的不舒服。但是不要重复询问已经询问过的。
+在你确保询问完毕以上所有诊断方面后，请务必询问患者是否还有其他不舒服的地方，询问“您是否还有其他不舒服的地方？”。并且一直询问直到患者回答没有其他不舒服的地方了为止。
+例如你询问是否还有其他不舒服的地方？，患者回答有点咳嗽，你应该询问患者咳嗽有多长时间了，然后再次询问患者除了咳嗽，是否还有其他不舒服的地方？
+然后注意下面的问题均需要全部询问。关于手术和用药患者可能有多场手术与多个用药，可以在询问时，补充询问患者是否还有其他手术，其他用药。
+注意不要出现“好的，张三。除了发热，您还有其他不舒服的地方吗？比如血尿、尿疼、尿失禁、排尿困难、腰痛、发热、恶心呕吐、晕厥等？”这种一次性询问完了所有的诊断方面，应该使用“请问您有××的情况吗？”一个一个询问患者。
+
+诊断方面 去医院看过吗？: 
+	如果患者回答无则直接进行下一个诊断方面的提问
+	如果患者回答有需要了解以下信息: 
+		在哪看的？
+		什么时候看的？
+		大夫怎么说？
+		做了什么检查？
+			若患者回答做了检查，则询问以下问题，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+			检查结果如何？
+		如何治疗了？
+			如果患者回答治疗方法包括手术，询问以下问题，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+				什么手术？
+				术后怎么处理的？
+				效果怎么样？
+			如果患者回答治疗方法包括用药，则了解以下信息，务必一问一答，与患者有来有回的对话式问答，千万不可以一下子问出多个问题
+				吃了什么药？
+				怎么用的？
+				效果怎么样？
+
+诊断方面 一般情况，务必按照下面的问题依次进行展开追问，每次务必只提问一个问题，在后面的交流中，如果有患者已经回答过的症状可以跳过询问：
+	需要询问: 发病以来精神与睡眠状况怎么样？ 	
+	需要询问: 发病以来食欲饭量怎么样？ 
+	需要询问: 大便是否正常？
+				如果患者回答正常，则进行下一个需要询问
+				否则如果患者回答不正常，则询问他：是否有便秘？	
+	需要询问: 自发病以来体重有什么变化吗？ 
+	需要询问: 体力怎么样？ 
+
+诊断方面 既往史，每次务必只提问一个问题，如果既往史中的疾病在过往问题中已经问过，且患者回答没有，则不需要在询问该类病症：
+		高血压、糖尿病、心脑血管疾病、其他疾病。依次询问患者是否有该疾病，如果有其中任何一种疾病，则需要下面对应疾病的问题全部提问，注意每种疾病都需要一一提问，每种疾病的问题都需要全部提问，每次务必只提问一个问题:
+		注意询问完患者是否药物治疗以及询问完相关的问题后，一定要询问患者疾病目前控制的怎么样，不能直接跳过。最后还需询问还有什么其他疾病。
+		高血压：（若患者血压不高，但是仍然吃降血压药，则也算是高血压。）
+			多长时间了？
+			怎么治疗的？用药了吗？
+				若药物治疗
+					用的什么药物？
+					药物剂量，用法如何？
+					是否规律治疗？
+				否则继续询问下面的问题
+			目前控制的怎么样？最高收缩压是多少？日常血压是多少？
+
+		糖尿病：
+			多长时间了？
+			怎么治疗的？用药了吗？
+				若药物治疗
+					用的什么药物？
+					药物剂量，用法如何？
+					是否规律治疗？
+				否则继续询问
+			目前控制的怎么样？日常空腹血糖是多少？餐后血糖是多少？
+
+		心脑血管疾病：
+			多长时间了？
+			怎么治疗的？用药了吗？
+				若药物治疗
+					用的什么药物？
+					药物剂量，用法如何？
+					是否规律治疗？
+				若手术治疗。
+					做的什么手术？
+					什么时候做的手术？
+					在哪做的手术？
+					术后怎么治疗的呢？
+						无治疗
+							若药物治疗
+								用的什么药物？
+								治疗了多少次(周期)？
+								是否规律治疗？
+				否则继续询问下面的问题
+			目前控制的怎么样？
+
+		还有其他疾病吗？：
+			多长时间了？
+			怎么治疗的？用药了吗？
+				若药物治疗
+					用的什么药物？
+					药物剂量，用法如何？
+					是否规律治疗？
+				否则继续询问下面的问题
+			目前控制的怎么样？
+
+		除上述疾病外，还有其他疾病吗？：
+			多长时间了？
+			怎么治疗的？用药了吗？
+				若药物治疗
+					用的什么药物？
+					药物剂量，用法如何？
+					是否规律治疗？
+				否则继续询问下面的问题
+			目前控制的怎么样？
+		注意注意：需要一直询问患者是否有其他疾病，直到患者回答没有了。
+		
+		需要询问: 以前还做过什么手术吗？
+					如果患者回答做过，则追问下列问题
+						做的什么手术？
+						什么时候做的手术？
+						在哪做的手术？
+						术后怎么治疗的呢？
+							无治疗
+							若药物治疗
+								用的什么药物？
+								治疗了多少次(周期)？
+								是否规律治疗？
+		需要询问: 得过乙肝、结核等传染性吗？
+		需要询问: 受过较大外伤吗？
+		需要询问: 输过血吗？
+			否
+			是：因为什么原因输的血？是否有输血反应
+		需要询问: 对什么食物或药物过敏吗？ 
+            若患者有过敏，则追问患者的过敏的表现。
+		需要询问: 预防疫苗是定期接种吗？ 
+
+诊断方面 个人史，每次务必只提问一个问题: 
+	需要询问: 是否抽烟？ 如果吸烟，需要继续追问
+			吸烟多少年？
+			每天多少支？
+	需要询问: 是否饮酒？ 如果饮酒，需要继续追问 
+			饮酒多少年？
+			每天多少量？
+	需要询问: 近期是否去过传染病发病区？
+	需要询问：出生在哪里？
+	需要询问：久居地是哪里？
+	仔细慢慢回忆一下患者的性别，然后回答下面的问题：
+	注意：根据最开始的询问性别的问题，若患者为女性则需要询问下列四个有关月经的问题：
+		月经初潮是什么时候？
+		月经周期是多少天？
+		月经经期是多少天？
+		末次月经是什么时候？
+
+诊断方面 婚姻生育史，每次务必只提问一个问题: 
+	需要询问: 结婚了吗？ 
+	需要询问: 有小孩吗？几个？ 
+
+诊断方面 家族史，每次务必只提问一个问题: 
+	需要询问: 家里有人跟你有相同症状的情况吗？ 
+	需要询问: 家族中有遗传病吗？
+	需要询问: 家里有人得过肿瘤吗？（若之前患者回答过家里有人得过肿瘤则无需再次询问）
+            若患者家里人得过肿瘤则追问是什么肿瘤？
+
+当你收集信息完毕的时候，请让用户上传检查报告
+"""
+functions = [{
+    "name": "extract_json",
+    "description": "从病历中提取Json数据",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "name": {
+                "type": "string",
+                "description": "患者姓名，如果没有相关信息则返回未知"
+            },
+            "age": {
+                "type": "number",
+                "description": "患者年龄，如果没有相关信息则返回未知"
+            },
+            "gender": {
+                "type": "string",
+                "description": "患者性别，只能是以下三种取值中的一种[男、女、未知]"
+            },
+            "chief_complaint": {
+                "type": "string",
+                "description": "患者主诉，如果没有相关信息则返回未知"
+            },
+            "history_of_present_illness": {
+                "type": "string",
+                "description": "患者现病史，如果没有相关信息则返回未知"
+            },
+            "past_medical_history": {
+                "type": "string",
+                "description": "患者既往史，如果没有相关信息则返回未知"
+            },
+            "personal_history": {
+                "type": "string",
+                "description": "患者个人史，如果没有相关信息则返回未知"
+            },
+            "marital_and_reproductive_history": {
+                "type": "string",
+                "description": "患者婚姻生育史，如果没有相关信息则返回未知"
+            },
+            "family_and_genetic_history": {
+                "type": "string",
+                "description": "患者家族史，如果没有相关信息则返回未知"
+            },
+            "history_of_infectious_diseases": {
+                "type": "string",
+                "description": "传染病史，如果没有相关信息则返回未知"
+            },
+            "vaccination_history": {
+                "type": "string",
+                "description": "预防接种史，如果没有相关信息则返回未知"
+            },
+            "auxiliary_inspection_records": {
+                "type": "string",
+                "description": "辅助检查，如果没有相关信息则返回未知"
+            },
+        },
+        "required": ["name", "age", "gender", "chief_complaint", "history_of_present_illness", "past_medical_history",
+                     "personal_history", "marital_and_reproductive_history", "family_and_genetic_history",
+                     "history_of_infectious_diseases", "vaccination_history", "auxiliary_inspection_records"]
+    }
+}]
+
+
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        if "Authorization" in request.headers:
+            token = request.headers["Authorization"].split(" ")[1]
+        if not token:
+            return {
+                       "message": "Authentication Token is missing!",
+                       "data": None,
+                       "error": "Unauthorized"
+                   }, 401
+        try:
+            data = jwt.decode(token, current_app.config["SECRET_KEY"], algorithms=["HS256"])
+            current_user = data
+            if current_user is None:
+                return {
+                           "message": "Invalid Authentication token!",
+                           "data": None,
+                           "error": "Unauthorized"
+                       }, 401
+        except Exception as e:
+            return {
+                       "message": "Something went wrong",
+                       "data": None,
+                       "error": str(e)
+                   }, 500
+
+        return f(current_user, *args, **kwargs)
+
+    return decorated
+
+
+def whisper_stt(language=None, audio=None):
+    if audio is None:
+        output = None
+    else:
+        success = False
+        err = 0
+        while not success and err < 3:  # Retry up to 3 times in case of OpenAI server error.
+            try:
+                transcript = openai_client.audio.transcriptions.create(
+                    model="whisper-1",
+                    file=audio,
+                    language=language
+                )
+            except Exception as e:
+                print(str(e))  # log the exception in the terminal
+                err += 1
+            else:
+                success = True
+                output = transcript.text
+
+    return output
+
+
+# 帮我写一个获取历史对话记录的接口，get，参数为uid，返回conversation_history = session.get('conversation_history', {}).get(uid, [])
+
+@app.route('/api/get_conversation_history', methods=['GET'])
+def get_conversation_history():  # uid为空返回400
+    if 'uid' not in request.args:
+        return jsonify(error='Missing uid'), 400
+    uid = request.args.get('uid')
+    # 通过user_seesions获取历史对话记录
+    user_sessions = session_manager.load_user_sessions(uid)
+    conversation_history = user_sessions.get('conversation_history', [])
+    return jsonify({'status': 'success', 'conversation_history': conversation_history})
+
+
+@app.route('/api/generate_report', methods=['POST'])
+def generate_report():
+    if not request.json or 'uid' not in request.json:
+        return jsonify(error='Missing uid'), 400
+
+    uid = request.json['uid']
+    user_sessions = session_manager.load_user_sessions(uid)
+
+    if 'report_str' not in user_sessions:
+        user_sessions['report_str'] = {}
+
+    # 从user_sessions中获取历史对话信息和报告OCR结果
+    conversation_history = user_sessions.get('conversation_history', [])
+    ocr_results = user_sessions.get('ocr_results', "")
+
+    if not conversation_history:
+        return jsonify(error='No conversation history or OCR results found for the given uid'), 400
+
+    # 拼接对话记录
+    dialogue = "\n".join(
+        [f"{'患者' if msg['role'] == 'user' else '医生'}: {msg['content']}" for msg in conversation_history])
+
+    ocr_texts = ""
+    # 拼接OCR结果
+    if ocr_results:
+        ocr_texts = "\n".join(
+            [",".join([words['words'] for words in ocr_result['ocr_result']["words_result"]]) for ocr_result in
+             ocr_results])
+
+    if dialogue + ocr_texts in user_sessions['report_str']:
+        if user_sessions['report_str'][dialogue + ocr_texts] != "":
+            return jsonify({'status': 'success', 'report': user_sessions['report_str'][dialogue + ocr_texts]})
+
+    ####
+    # 直接传 json
+    # if ocr_results:
+    #     index = 0
+    #     for ocr_result in ocr_results:
+    #         ocr_texts += f"报告{index}:" + str(ocr_result['ocr_result']['words_result'])+'\n'
+    #         index += 1
+    ####
+
+    # 构造messages
+    report_str = pure_generate_report(dialogue, ocr_texts)
+    user_sessions['report_str'][dialogue + ocr_texts] = report_str
+    thread_id = user_sessions.get('thread_id')
+    store_history(thread_id, dialogue, ocr_texts, report_str)
+    session_manager.save_user_sessions(uid, user_sessions)
+    return jsonify({'status': 'success', 'report': report_str})
+
+
+def store_history(thread_id, dialogue, ocr_texts, report_str):
+    # 确保目录存在
+    os.makedirs('chat_history', exist_ok=True)
+
+    # 你的处理逻辑
+    content = dialogue + "\n" + ocr_texts + "\n" + report_str
+
+    # 在 return 之前将数据写入文件
+    with open(f'chat_history/{thread_id}.txt', 'w', encoding='utf-8') as file:
+        file.write("Dialogue:\n")
+        file.write(dialogue + "\n\n")
+        file.write("OCR Texts:\n")
+        file.write(ocr_texts + "\n\n")
+        file.write("Result:\n")
+        file.write(content + "\n")
+
+
+# get接口根据uid下载一个txt文件，文件内包含历史对话记录、ocr结果和生成的病历
+@app.route('/api/download_report', methods=['GET'])
+def download_report():
+    if 'uid' not in request.args:
+        return jsonify(error='Missing uid'), 400
+    uid = request.args.get('uid')
+    user_sessions = session_manager.load_user_sessions(uid)
+    # 将conversation_history, ocr_results, report_str写入文件，路径为download/{uid}.txt
+    conversation_history = user_sessions.get('conversation_history', [])
+    ocr_results = user_sessions.get('ocr_results', "")
+    # 拼接对话记录
+    dialogue = "\n".join(
+        [f"{'患者' if msg['role'] == 'user' else '医生'}: {msg['content']}" for msg in conversation_history])
+
+    if not conversation_history:
+        return jsonify(error='No conversation history or OCR results found for the given uid'), 400
+        # 判断路径是否存在
+    if not os.path.exists('download'):
+        os.makedirs('download')
+    # 生成文件
+    ocr_texts = ""
+    # 拼接OCR结果
+    if ocr_results:
+        ocr_texts = "\n".join(
+            [",".join([words['words'] for words in ocr_result['ocr_result']["words_result"]]) for ocr_result in
+             ocr_results])
+
+    report_str = user_sessions.get('report_str', {}).get(dialogue + ocr_texts, "")
+    file_path = f'download/{uid}.txt'
+    with open(file_path, 'w', encoding='utf-8') as file:
+        file.write("Dialogue:\n")
+        for msg in conversation_history:
+            file.write(f"{'患者' if msg['role'] == 'user' else '医生'}: {msg['content']}\n")
+        file.write("\nOCR Texts:\n")
+        for ocr_result in ocr_results:
+            file.write(",".join([words['words'] for words in ocr_result['ocr_result']["words_result"]]) + "\n")
+        file.write("\nResult:\n")
+        file.write(report_str)
+    # 直接触发浏览器下载操作
+    return send_file(file_path, as_attachment=True)
+
+
+# @app.route('/api/v2/generate_report', methods=['POST'])
+# def generate_report_v2():
+#     if not request.json or 'uid' not in request.json:
+#         return jsonify(error='Missing uid'), 400
+#
+#     uid = request.json['uid']
+#
+#     # 从session中获取历史对话信息和报告OCR结果
+#     conversation_history = session.get('conversation_history', {}).get(uid, [])
+#     ocr_results = session.get('ocr_results', {}).get(uid, [])
+#
+#     if 'report_str' not in session:
+#         session['report_str'] = {}
+#     if uid not in session['report_str']:
+#         session['report_str'][uid] = []
+#
+#     if not conversation_history:
+#         return jsonify(error='No conversation history or OCR results found for the given uid'), 400
+#
+#     # 拼接对话记录
+#     dialogue = "\n".join(
+#         [f"{'患者' if msg['role'] == 'user' else '医生'}: {msg['content']}" for msg in conversation_history])
+#
+#     ocr_texts = ""
+#     # 拼接OCR结果
+#     if ocr_results:
+#         ocr_texts = "\n".join(
+#             [",".join([words['words'] for words in ocr_result['ocr_result']["words_result"]]) for ocr_result in
+#              ocr_results])
+#
+#     ####
+#     # 直接传 json
+#     # if ocr_results:
+#     #     index = 0
+#     #     for ocr_result in ocr_results:
+#     #         ocr_texts += f"报告{index}:" + str(ocr_result['ocr_result']['words_result'])+'\n'
+#     #         index += 1
+#     ####
+#
+#     # 构造messages
+#     res = pure_generate_report(dialogue, ocr_texts)
+#     # report_str = pure_change_medical_record(res)
+#
+#     return jsonify({'status': 'success', 'report': res})
+#
+
+def pure_generate_report(dialogue, ocr_texts):
+    messages = [
+        SystemMessage(
+            content="""你是天津医科大学第二医院一位泌尿外科的医生。你需要的不是创作，你必须严谨的根据目前你和患者的聊天记录和患者上传的检查报告，生成该患者的病历，该病历只能包含该患者在聊天记录和患者上传的检查报告中体现的真实情况，患者未表明的情况必须使用“不详”来表述，不能擅自添加症状或者表明患者无某症状。
+要严格注意以下要求：
+如果不存在的信息，或者对话中未提到的信息，生成的病历中不要出现。
+生成病历中包含以下几个部分：姓名、年龄、性别、主诉、现病史、即往史、个人史、婚姻生育史、家族史、辅助检查。
+
+姓名：
+年龄：
+性别：
+
+主诉：
+    根据目前你和患者的聊天记录和患者上传的检查报告生成，需要凝练，使用专业词句（20字以内），若患者还回答了病情的相关时间信息，则病情描述可以使用“病情+时间（例如2月余）”。
+    若为复查需要体现出复查结果，可用句式“复查发现xxxx（病症）+时间”。
+    若患者患有多个症状，一般加上“伴”。例如“xx病症+时间伴xx病症+时间”。按照时间顺序，时间长的放在前面。
+    可以考虑一定的因果关系，比如尿频尿急尿痛（尿路刺激症，尿路感染的典型症状），比较容易导致发热。若患者回答他不舒服发热3天，同时有尿频3年、尿急尿痛2周的症状，由于尿频尿急尿痛时间更长，所以放在前面，然后将“伴”字放在发热前面，因此可以写为“尿频3年，尿急、尿痛2周，伴发热3天”。
+
+现病史（一定要体现泌尿外科相关的检查报告情况）：
+    一定要只根据目前你和患者的聊天记录和患者上传的检查报告生成，你病历上的一切信息必须在目前你和患者的聊天记录和患者上传的检查报告中能找到依据。千万不可自己在病历加上患者未给你提供信息的非真实的情况，凭空捏造。
+    首先描述患者病症情况(无需显示xxxx-xx-xx的具体时间），需要体现患者是如何发现病情的。
+    患者若为血尿、腰痛、发热、尿失禁的病症，则病历需要体现诱因，若无诱因，可以表述为“无明显诱因”。
+    描述患者现在的病症以及不舒服的情况（对患者的现病史要全面，不能漏掉症状，有无症状都需要通过与患者的对话以及检查报告来判断）。
+    若有你询问了患者是否有该症状并且患者明确回答没有的症状，这时可以使用“患者自诉无xxx、xxx症状”来表述。
+    对于血尿、尿频、尿疼、尿失禁、排尿困难、腰痛、发热、恶心呕吐、晕厥这九种症状，若某一种症状患者未明确说明情况，则以“xxx病症不详”来表述。
+    注意注意！此时检查是否有患者患了该病症，但是未表明情况，例如患者有过尿失禁，但是在现病史中未表明患者尿失禁的情况，这时需要重新补上去，补充在句式“患者自诉无xxxx症状”之前。
+    然后描述患者做过的检查/手术情况。
+    若患者之前在外院或者本院有过检查/手术，需要以句式"遂于xxxx医院行xxxx检查/手术（xxxx-xx-xx）"。括号里是时间，若时间不详则不显示时间。
+    必须要将检查时间放在括号里，例如“患者遂于xxxx医院行xx检查（xxxx-xx-xx）”。
+    而后固定句式"现患者为求进一步诊治，遂前来我院门诊就诊"，然后描述患者在本院做了何种检查（时间xxxx-xx-xx放在括号里，置于检查名称后，若时间不详则不显示时间。），检查结果如何。
+    若患者病症是通过检查得出，则将该检查的论述放在固定句式"现患者为求进一步诊治，遂前来我院门诊就诊"之前。
+    而后跟随固定句式"门诊以'xxx病'（病症描述要专业，“前列腺钙化”不应在此处作为入院病症，应该考虑其他可能）收入我科治疗。患者自发现病情以来，精神、睡眠状况xx，饮食情xx，大便xx，小便xx，体重xx"，必须根据患者真实情况来表述，不可不根据患者情况表述该内容。注意若患者的聊天记录与检查报告中未说明精神、睡眠状况等情况，则使用“xxx不详”表述。全部正常情况例如：门诊以'xxx病'收入我科治疗。患者自发现病情以来，精神、睡眠状况尚可，饮食情况可，大便如常，小便如常，体重无著变。
+    注意若是有肿物和结石以及肿瘤等物质的大小、数目数据，务必体现出来。
+    因为是现病史，所以以上检查只需要泌尿外科相关的检查（例如膀胱MRI）及其结果，但是千万不能遗漏某一个检查，泌尿外科相关的检查及其结果均需体现。
+    检查情况要根据时间从前往后叙述。
+    检查情况不能使用完善字样，那是辅助检查的格式，可以使用句式"遂于xxxx医院行xxxx检查/手术（xxxx-xx-xx）"。
+
+既往史：
+    根据目前你和患者的聊天记录和患者上传的检查报告生成，千万不可自己加上去非患者真实的情况。
+    若患者回答了是否患有高血压，糖尿病，心脑血管疾病等疾病的情况，则需要包含高血压，糖尿病，心脑血管疾病等疾病情况。若无相关描述，则直接写“不详”即可。
+    疾病控制情况需要体现出来。比如血糖控制良好？ 控制一般？不佳？
+    对于没有的病症史，使用专业句式，例如“无xx史。”
+
+个人史：
+    个人史生成需要根据目前你和患者的聊天记录和患者上传的检查报告生成，千万不可自己加上去非患者真实的情况。
+    若患者回答了出生地，久居地，病史相关问题则使用专业句式，例如“生于xxx，久居xxx。无xx史。”。否则若患者未回答相关信息使用不详描述。
+    若患者回答了吸烟史以及饮酒史，则生成吸烟史和饮酒史时，需要分开详细记录。否则若患者未回答相关信息则使用不详描述。
+    每天多少支烟，回答可能是包，需要转换一下1包=20支。
+    若患者为女性，则需要包含月经的相关信息。男性则无需考虑，病历中更不用显示任何相关内容。
+
+婚姻生育史：根据目前你和患者的聊天记录和患者上传的检查报告生成，千万不可自己加上去非患者真实的情况。
+
+家族史：根据目前你和患者的聊天记录和患者上传的检查报告生成，千万不可自己加上去非患者真实的情况。
+
+辅助检查（检查报告OCR的结果）：
+    根据目前你和患者的聊天记录和患者上传的检查报告生成，千万不可自己加上去非患者真实的情况。
+    这一部分按照时间顺序将患者的检查报告OCR按照检查项目（日期+医院），结果（肿瘤大小什么的应该要加上，描述肿瘤的大小、数目——单发/多发；或者比如结石患者的结石大小，数目）列举出来。
+    注意分段列举，一个报告一段，不能一段描述多个报告。
+    注意需要先泌尿专科，再非泌尿的，比如头核磁，胸CT。
+    例如患者完善xxxx检查（xxxx-xx-xx，xxxx医院）:膀胱内可见多发占位，最大者直径4cm......    
+    （另起一段）患者完善泌尿系彩超（日期+医院）： 结果； 
+    （另起一段）患者完善泌尿系彩超（日期+医院）： 结果；
+
+以下为专业补充：
+“无明显诱因”这个词要慎用，比如不能出现“体检时发现肿物，无明显诱因”。
+现病史需要包括泌尿外科的相关检查报告，而辅助检查则包含检查报告OCR中的所有检查。
+需要包含接触史，预防接种史、婚育、家族中传染病、遗传病字段描述，即使阴性也需要体现。
+针对检查报告只需要诊断结果，不需要诊断现象描述。
+注意所有的检查及其结果均需体现在病历中。
+专业的医疗用语：“尿中有血”即为血尿。
+在生成病历时要注意使用专业的医疗用语，例如:尿血2个月（应该是血尿）；整个排尿过程（应该是全程）； 患者自诉尿中有血，所以是肉眼可见了，临床中，专业术语应该是 "全程肉眼血尿； 疼痛为火辣辣感，应该是灼烧感。"
+对于约数词三四年，五六次，这种可以直接采用最大数；对于十几年这种表述，可以采用十年余这种表述。
+当患者回答的是泌尿外科相关疾病（与本次就诊相关）则应该追问后放在现病史中；当患者回答的是其他科室疾病（例如胃病、高血压、外伤等），则应该放在个人史中。
+心脏疾病中的心跳过速应该使用专业词汇“心动过速”来描述。
+肾病综合症的膜性二期需要使用专业词汇“膜性肾病二期”来描述。
+各病史不能使用数字分点描述格式。
+尿到最后出现血尿，在病历中应该用专业术语“终末血尿”来表达。
+小肚子应该使用专业术语“下腹部”来表示。
+若患者血压不高，但是仍然吃降血压药，则也算是高血压。"""
+        ),
+        HumanMessage(
+            content=f"患者和你的聊天记录是：\n{dialogue}\n患者上传的检查报告内容是：\n{ocr_texts}"
+        ),
+
+    ]
+    print("[generate_report-dialogue] " + dialogue)
+    print("[generate_report-ocr_texts] " + ocr_texts)
+
+    # 调用OpenAI API生成病历
+    # chat = ChatOpenAI(model_name='gpt-4o-2024-05-13', temperature=0)
+    response = bingli_generator.invoke(messages)
+    print("[generate_report-response] " + response.content)
+    return response.content
+
+
+def pure_change_medical_record(report):
+    if report:
+        messages = [
+            SystemMessage(
+                content="你是一位泌尿外科的医生，你需要根据用户的输入，生成对应的病历结构化json"
+            ),
+            HumanMessage(
+                content=report
+            )
+        ]
+        response = json_generator.invoke(messages, functions=functions, function_call={'name': 'extract_json'})
+
+        print("[assistant.response]" + response.additional_kwargs['function_call']['arguments'])
+        return response.additional_kwargs['function_call']['arguments']
+        # return jsonify({'status': 'success', 'content': response.additional_kwargs['function_call']['arguments']})
+    else:
+        return ""
+
+
+def text_to_speech_ai(speech_file_path, api_response):
+    client = OpenAI(base_url="https://openai.arnotho.com/v1",
+                    api_key=env("MODEL_API_KEY_1"))
+    response = client.audio.speech.create(model="tts-1", voice="alloy", input=api_response)
+    response.stream_to_file(speech_file_path)
+
+
+@app.route('/api/change_medical_record', methods=['POST'])
+def change_medical_record():
+    # if 'audioFile' not in request.files:
+    #     return 'No file part', 400
+
+    report = request.json['text']
+    uid = request.json['uid']
+    if report == '':
+        return 'No report', 400
+
+    user_sessions = session_manager.load_user_sessions(uid)
+
+    if "report_json" not in user_sessions:
+        user_sessions["report_json"] = {}
+    if report in user_sessions["report_json"]:
+        return jsonify({'status': 'success', 'content': user_sessions['report_json'][report]})
+    if report:
+        content = pure_change_medical_record(report)
+        user_sessions['report_json'][report] = content
+        session_manager.save_user_sessions(uid, user_sessions)
+        return jsonify({'status': 'success', 'content': content})
+
+
+@app.route('/api/generate_response', methods=['POST'])
+def generate_response():
+    # Check if there is text input in the request
+    print("[log generate_response] start")
+    if not request.json or 'text' not in request.json:
+        return jsonify(error='Missing text'), 400
+
+    user_input = request.json['text']
+    uid = request.json['uid']
+
+    user_sessions = session_manager.load_user_sessions(uid)
+    if 'conversation_history' not in user_sessions:
+        user_sessions['conversation_history'] = []
+
+   
+    # print("[log generate_response] uid = " + str(session.get(uid)))
+    # if user_sessions.get('thread_id') is None:
+    #     response = agent_executor.invoke({"content": user_input})
+    #     user_sessions['thread_id'] = response['thread_id']
+    #     print("[log generate_response] set uid :" + str(user_sessions.get('thread_id')))
+    #     print("[log generate_response] finish :" + response["output"])
+    # else:
+    #     # print("[log generate_response] tid = " + str(session[uid]))
+    #     response = agent_executor.invoke({"content": user_input, 'thread_id': user_sessions['thread_id']})
+    # # speech_file_path = 'audio_response.mp3'
+    # # text_to_speech_ai(speech_file_path, response["output"])
+    # print("[log generate_response] audio finish")
+    response = pure_generate_response(user_input, qa_chat, user_sessions['conversation_history'], QA_PROMPT)
+    user_sessions['conversation_history'].append({"role": "user", "content": user_input})
+    user_sessions['conversation_history'].append({"role": "assistant", "content": response.content})
+    session_manager.save_user_sessions(uid, user_sessions)
+    return jsonify({'audio': 'audio_response', 'text': response.content})
+
+
+@app.route('/api/upload_check_record', methods=['POST'])
+def upload_image():
+    if 'image' not in request.files:
+        return 'No file part', 400
+
+    file = request.files['image']
+    if file.filename == '':
+        return 'No selected file', 400
+
+    # 校验上传的文件是否为图片
+    if not file.content_type.startswith('image/'):
+        return jsonify({"status": "error", "message": "请上传图片文件"}), 400
+
+    if file:
+        # 获取文件内容并进行OCR识别
+        res_image = ocr_client.basicGeneral(file.read())
+        print(res_image)
+
+        # 获取用户ID和线程ID
+        uid = request.form.get('uid')
+        user_sessions = session_manager.load_user_sessions(uid)
+
+        # thread_id = user_sessions.get('thread_id')
+        # if not thread_id:
+        #     return jsonify({"status": "error", "message": "无效的用户ID或线程ID"}), 400
+
+        # 获取当前日期
+        current_date = datetime.datetime.now().strftime('%Y-%m-%d')
+
+        # 初始化图片存储路径和序号
+        base_dir = 'uploaded_images'
+        image_dir = os.path.join(base_dir, current_date)
+        os.makedirs(image_dir, exist_ok=True)
+        # 获取当前文件夹中的图片数量
+        image_count = len([name for name in os.listdir(image_dir) if
+                           os.path.isfile(os.path.join(image_dir, name)) and name.startswith(uid)])
+
+        # 生成图片文件名
+        image_filename = f"{uid}_{image_count + 1}.jpg"
+        image_path = os.path.join(image_dir, image_filename)
+
+        print(f"Image will be saved to: {image_path}")
+
+        # 生成图片文件名
+        image_filename = f"{uid}_{image_count + 1}.png"
+        image_path = os.path.join(image_dir, image_filename)
+
+        # 保存图片文件
+        file.seek(0)  # 重置文件指针
+        file.save(image_path)
+
+        # 存储OCR结果和图片路径到session
+        if 'ocr_results' not in user_sessions:
+            user_sessions['ocr_results'] = []
+
+        user_sessions['ocr_results'].append({"image_path": image_path, "ocr_result": res_image})
+        session_manager.save_user_sessions(uid, user_sessions)
+
+        return jsonify({"status": "success", "image_path": image_path, "ocr_result": res_image})
+
+# 计算对话轮次
+@app.route('/api/get_conversation_rounds', methods=['GET'])
+def get_conversation_rounds():
+    if 'uid' not in request.args:
+        return jsonify(error='Missing uid'), 400
+    
+    uid = request.args.get('uid')
+    user_sessions = session_manager.load_user_sessions(uid)
+    conversation_history = user_sessions.get('conversation_history', [])
+    
+    # 计算对话轮次
+    # 一轮对话由用户发言和医生回复组成
+    rounds = 0
+    user_messages = 0
+    
+    for msg in conversation_history:
+        if msg['role'] == 'user':
+            user_messages += 1
+    
+    # 计算完整的对话轮次
+    rounds = user_messages
+    
+    # 检查是否有问诊记录
+    has_consulted = rounds > 0
+    
+    return jsonify({
+        'status': 'success', 
+        'uid': uid,
+        'rounds': rounds,
+        'hasConsulted': has_consulted
+    })
+
+# 添加一个批量获取多个UID的对话轮次的接口
+@app.route('/api/get_multiple_conversation_rounds', methods=['POST'])
+def get_multiple_conversation_rounds():
+    if not request.json or 'uids' not in request.json:
+        return jsonify(error='Missing uids'), 400
+    
+    uids = request.json['uids']
+    results = []
+    
+    for uid in uids:
+        user_sessions = session_manager.load_user_sessions(uid)
+        conversation_history = user_sessions.get('conversation_history', [])
+        
+        # 计算对话轮次
+        user_messages = 0
+        for msg in conversation_history:
+            if msg['role'] == 'user':
+                user_messages += 1
+        
+        rounds = user_messages
+        has_consulted = rounds > 0
+        
+        results.append({
+            'uid': uid,
+            'rounds': rounds,
+            'hasConsulted': has_consulted
+        })
+    
+    return jsonify({
+        'status': 'success', 
+        'results': results
+    })
+
+
+def pure_generate_response(user_input, chat, msgs, system):
+    # 构建包含所有历史对话内容的 messages 列表
+
+    messages = [
+        SystemMessage(
+            content=system),
+    ]
+    # 添加历史对话内容
+    for msg in msgs:
+        if msg['role'] == "user":
+            messages.append(HumanMessage(content=msg['content']))
+        else:
+            messages.append(AIMessage(content=msg['content']))
+    messages.append(HumanMessage(content=user_input))
+    response = chat.invoke(messages)
+    return response
+
+
+@app.route('/api/upload_audio', methods=['POST'])
+def upload_audio():
+    if 'audioFile' not in request.files:
+        return 'No file part', 400
+
+    file = request.files['audioFile']
+    file_bytes = file.read()
+    audio_bio = io.BytesIO(file_bytes)
+    audio_bio.name = 'audio.webm'
+    if file.filename == '':
+        return 'No selected file', 400
+    if file:
+        text = whisper_stt(language='zh', audio=audio_bio)
+        # Return a response, possibly the results of your audio processing
+        return {'status': 'success', 'content': text}, 200
+
+
+@app.before_request
+def before_request():
+    if request.method == 'OPTIONS':
+        response = app.make_default_options_response()
+        headers = None
+        if 'ACCESS_CONTROL_REQUEST_HEADERS' in request.headers:
+            headers = request.headers['ACCESS_CONTROL_REQUEST_HEADERS']
+        response.headers['Access-Control-Allow-Headers'] = headers
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS, PUT, DELETE'
+        return response
+
+@app.after_request
+def after(resp):
+    origin = request.headers.get('Origin')
+    if origin:
+        resp.headers['Access-Control-Allow-Origin'] = origin
+    resp.headers['Access-Control-Allow-Methods'] = 'GET,POST,OPTIONS'
+    resp.headers['Access-Control-Allow-Headers'] = 'x-requested-with,content-type'
+    resp.headers['Access-Control-Allow-Credentials'] = 'true'
+    return resp
+
+
+if __name__ == '__main__':
+    with app.app_context():
+        cache.clear()
+    app.run(debug=True, port=8503, host='0.0.0.0')

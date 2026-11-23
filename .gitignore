@@ -1,0 +1,34 @@
+# Local credentials (examples are safe to commit)
+local_settings.json
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Dependencies, build output and runtime files
+node_modules/
+.venv/
+.quasar/
+dist/
+__pycache__/
+*.pyc
+*.log
+flask_session/
+instance/
+
+# Patient data and generated reports stay local
+doctor-backend-main/json_session/
+doctor-backend-main/uploaded_images/
+doctor-backend-main/chat_history/
+doctor-backend-main/download/
+doctor-backend-main/audio_response.mp3
+doctor-backend-main/conversion.txt
+doctor-backend-main/1720793069.055464.txt
+doctor-backend-main/病历1问答-尿频.txt
+*.7z
+
+# Editor and operating-system files
+.idea/
+.DS_Store
+.~*
+*.code-workspace

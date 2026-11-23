@@ -1,0 +1,30 @@
+{
+  "class": "演示科室",
+  "code": "DEMO-001",
+  "profile": {
+    "name": "演示患者（虚构）",
+    "sex": "男",
+    "age": "30岁",
+    "family": "未填写",
+    "marriage": "未填写",
+    "registry": "未填写",
+    "phone": "未填写",
+    "reliable": "未填写",
+    "job": null,
+    "employer": null,
+    "address": "未填写",
+    "createdAt": "2024-01-01T00:00:00.000Z",
+    "recordedAt": "2024-01-01T00:00:00.000Z"
+  },
+  "symptom": {
+    "issue": "此处为界面演示占位内容。",
+    "current": "此处为界面演示占位内容。",
+    "history": "此处为界面演示占位内容。"
+  },
+  "index": {
+    "heat": "36.2",
+    "pulse": "74",
+    "breathe": "18",
+    "pressure": "135/63"
+  }
+}

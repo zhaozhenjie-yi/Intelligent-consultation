@@ -1,0 +1,30 @@
+{
+  "issue": {
+    "label": "患者主诉",
+    "content": "此处为界面演示占位内容。"
+  },
+  "current": {
+    "label": "现病史",
+    "content": "此处为界面演示占位内容。"
+  },
+  "history": {
+    "label": "既往史",
+    "content": "此处为界面演示占位内容。"
+  },
+  "marriage": {
+    "label": "个人史与婚姻史",
+    "content": "此处为界面演示占位内容。"
+  },
+  "family": {
+    "label": "家族遗传史与传染病史",
+    "content": "此处为界面演示占位内容。"
+  },
+  "immunization": {
+    "label": "预防接种史",
+    "content": "此处为界面演示占位内容。"
+  },
+  "suggestion": {
+    "label": "医生建议",
+    "content": "此处为界面演示占位内容。"
+  }
+}
