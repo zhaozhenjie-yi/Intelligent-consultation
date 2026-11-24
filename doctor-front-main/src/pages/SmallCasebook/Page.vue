@@ -22,11 +22,14 @@
 					:to="{ name: 'app.index' }"
 				/>
 
-				<div>病历本</div>
+				<div>病历本</div><q-space /><q-btn flat label="医生端" :to="{ name: 'app.large.casebook', query: { uid } }" />
 			</q-toolbar>
 		</q-header>
 
 		<q-page-container>
+			<q-banner v-if="loading">正在生成并整理病历，请稍候……</q-banner>
+			<q-banner v-else-if="loadError" class="bg-red-1">{{ loadError }}<q-btn flat label="重试" @click="requestCasebookData" /></q-banner>
+			<q-btn v-else label="下载病历" :href="downloadUrl" />
 			<q-page padding>
 				<q-card
 					id="identification"
@@ -44,7 +47,7 @@
 						class="q-px-sm q-py-xs"
 						id="property"
 					>
-						{{ fromProfileGender }} | {{ fromProfileAge }}岁 | 泌尿科A区
+						{{ fromProfileGender }} | {{ fromProfileAge }}岁 | 泌尿外科
 					</q-card-section>
 
 					<q-card-section
@@ -55,7 +58,7 @@
 							<q-icon
 								name="domain"
 								class="q-mr-xs"
-							/>住院号：38277466
+							/>病历号：{{ recordNumber }}
 						</div>
 					</q-card-section>
 				</q-card>
@@ -155,14 +158,21 @@
 
 <script setup lang="ts">
 import { ref, computed, onMounted } from 'vue';
-import { QLayoutProps } from 'quasar';
+import { QLayoutProps, Notify } from 'quasar';
+import { errorMessage, API_BASE_URL } from 'src/adaptor/Api';
+import { getUserId } from 'src/adaptor/User';
 
 import ProfileItem from './ProfileItem.vue';
 import DetailItem from './DetailItem.vue';
 
-import profileList from './sample/profile.json';
+const profileList = ['体温(℃)', '脉搏(次/分)', '呼吸(次/分)', '血压(mmHg)'].map((label) => ({ label, value: '未提供' }));
 
 const scrolled = ref(false);
+const loading = ref(true);
+const loadError = ref('');
+const uid = getUserId();
+const recordNumber = ref('未登记');
+const downloadUrl = `${API_BASE_URL}/download_report?uid=${encodeURIComponent(getUserId())}`;
 
 const setHeaderBackground: QLayoutProps['onScroll'] = (info) => {
 	scrolled.value = info.position > 20;
@@ -275,13 +285,19 @@ const fromHistoryExamination = computed<string>(() => {
 
 import { FetchCasebookData } from 'src/adaptor/FetchCasebookData';
 
-onMounted(async function requestCasebookData() {
-	const casebook = new Casebook();
-
-	await FetchCasebookData(casebook);
-
-	data.value = casebook.data;
-});
+async function requestCasebookData() {
+	loading.value = true; loadError.value = '';
+	try {
+		const casebook = new Casebook();
+		const patient = await FetchCasebookData(casebook);
+		recordNumber.value = patient.medical_record_number || '未登记';
+		data.value = casebook.data;
+	} catch (error) {
+		loadError.value = errorMessage(error);
+		Notify.create({ type: 'negative', message: loadError.value });
+	} finally { loading.value = false; }
+}
+onMounted(requestCasebookData);
 
 defineOptions({ name: 'Page.SmallCasebook' });
 </script>

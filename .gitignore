@@ -32,3 +32,7 @@ doctor-backend-main/病历1问答-尿频.txt
 .DS_Store
 .~*
 *.code-workspace
+
+# Patient registry database
+*.sqlite3
+*.sqlite3-*

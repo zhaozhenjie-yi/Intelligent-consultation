@@ -67,7 +67,7 @@
 
 						<q-item
 							clickable
-							:to="{ name: 'app.small.casebook' }"
+							:to="{ name: 'app.small.casebook', query: { uid: session.uid } }"
 						>
 							<q-item-section side>
 								<q-icon
@@ -103,6 +103,7 @@
 		<q-page-container>
 			<input
 				type="file"
+				accept="image/png,image/jpeg,image/webp,image/bmp"
 				ref="browser"
 				class="invisible fixed"
 				@change="uploadExamination"
@@ -121,7 +122,6 @@
 						:bg-color="message.sent ? 'grey-4' : 'white'"
 						:name="message.who"
 						:sent="message.sent"
-						text-html
 						@click="playOrPause(message.audioURL)"
 					>
 						<template
@@ -156,7 +156,6 @@
 					bg-color="grey-4"
 					:name="patientInfo?.name || '就诊人'"
 					sent
-					text-html
 					stamp="正在分析您的语音..."
 					v-if="inputing !== null"
 				></q-chat-message>
@@ -165,7 +164,6 @@
 					class="q-mt-md q-mb-xs"
 					:text="[receivingText]"
 					bg-color="white"
-					text-html
 					v-if="receiving !== null"
 				>
 					<template v-slot:name>
@@ -240,13 +238,10 @@
 <script setup lang="ts">
 import { ref, reactive, onMounted, onUnmounted } from 'vue';
 import { scroll, useQuasar } from 'quasar';
-import { useRoute } from 'vue-router';
+import { getUserId } from 'src/adaptor/User';
+import { api, errorMessage } from 'src/adaptor/Api';
 import { Session, Recorder, RecorderEvent } from './Session';
 
-// 定义props
-const props = defineProps<{
-	uid?: string
-}>();
 
 interface Message {
 	sent: boolean;
@@ -267,14 +262,14 @@ const inputing = ref<Recorder | null>(null);
 const inputingText = ref<string>('');
 const receiving = ref<Recorder | null>(null);
 const receivingText = ref<string>('');
-const locking = ref(false);
+const locking = ref(true);
 const playing = ref<string>('');
 const player = ref<HTMLAudioElement>(document.createElement('audio'));
 // 文本输入框
 const textInput = ref('');
 // 患者信息
 const patientInfo = ref<PatientInfo | null>(null);
-const route = useRoute();
+
 const $q = useQuasar();
 
 // 解析URL中的uid参数
@@ -291,62 +286,24 @@ onUnmounted(() => {
 });
 
 // 从URL中解析UID的函数
-function parseUrlForUid() {
-	// 优先从查询参数获取UID
-	let uid = route.query.uid as string;
-	
-	// 如果没有，尝试从props或路由参数获取
-	if (!uid) {
-		uid = props.uid || route.params.uid as string;
-	}
-	
-	if (uid) {
-		patientInfo.value = { uid };
-		// 从localStorage获取患者信息
-		try {
-			const savedPatients = localStorage.getItem('patientData');
-			if (savedPatients) {
-				const patients = JSON.parse(savedPatients);
-				const patient = patients.find((p: { uid: string }) => p.uid === uid);
-				if (patient) {
-					patientInfo.value = {
-						uid,
-						name: patient.name,
-					};
-					
-					// 更新患者的问诊状态
-					patient.consulted = true;
-					patient.consultationCount += 1;
-					localStorage.setItem('patientData', JSON.stringify(patients));
-				}
-			}
-		} catch (e) {
-			console.error('Failed to parse patient data', e);
-		}
-	} else if ($q && typeof $q.notify === 'function') {
-		// 只在$q可用且notify函数存在时才调用
-		$q.notify({
-			color: 'warning',
-			message: '未识别到就诊人信息',
-			icon: 'warning',
-		});
-	} else {
-		console.warn('未识别到就诊人信息');
+async function parseUrlForUid() {
+	const uid = getUserId();
+	patientInfo.value = { uid };
+	try {
+		const result = await api<{ patient: PatientInfo }>(`patients/${encodeURIComponent(uid)}`);
+		patientInfo.value = result.patient;
+	} catch {
+		// Anonymous conversations do not have a patient registry entry.
 	}
 }
 
 async function playOrPause(audioURL: string) {
+	if (!audioURL) return;
+	const audio = player.value;
+	if (playing.value === audioURL && !audio.paused) { audio.pause(); return; }
 	playing.value = audioURL;
-
-	const { value: audio } = player;
-
-	audio.load();
-
-	if (audio.readyState !== 4) {
-		await new Promise((resolve) => audio.addEventListener('canplay', resolve));
-	}
-
-	audio.play();
+	audio.src = audioURL;
+	try { await audio.play(); } catch { /* No playable audio. */ }
 }
 
 function scrollToBottom(duration: number = 0) {
@@ -396,6 +353,14 @@ session.addEventListener('received', () => {
 });
 
 async function startInput() {
+	if (session.locking) return;
+	try {
+		const health = await api<{ audioConfigured: boolean }>('health');
+		if (!health.audioConfigured) {
+			$q.notify({ type: 'warning', message: '语音转写尚未配置，请先使用文字输入。' });
+			return;
+		}
+	} catch (error) { $q.notify({ type: 'negative', message: errorMessage(error) }); return; }
 	const recorder = session.sent(patientInfo.value?.name || '就诊人');
 
 	recorder.addEventListener('text-change', () => {
@@ -405,7 +370,10 @@ async function startInput() {
 
 	inputingText.value = ' ';
 	inputing.value = recorder;
-	await recorder.start();
+	try { await recorder.start(); } catch (error) {
+		inputing.value = null; session.unlock();
+		$q.notify({ type: 'negative', message: errorMessage(error) });
+	}
 }
 
 async function appendMessage() {
@@ -415,37 +383,18 @@ async function appendMessage() {
 		return;
 	}
 
-	await recorder.stop(true);
-	inputing.value = null;
+	try { await recorder.stop(true); } catch (error) {
+		$q.notify({ type: 'negative', message: errorMessage(error) });
+		session.unlock();
+	} finally { inputing.value = null; }
 	scrollToBottom(500);
 }
 
 async function sendText() {
-	if (!textInput.value.trim()) {
-		return;
-	}
-	
-	session.put(true, patientInfo.value?.name || '就诊人', 'example', textInput.value);
-	
-	// 如果有就诊人ID，更新问诊状态
-	if (patientInfo.value?.uid) {
-		try {
-			const savedPatients = localStorage.getItem('patientData');
-			if (savedPatients) {
-				const patients = JSON.parse(savedPatients);
-				const patientIndex = patients.findIndex((p: { uid: string }) => p.uid === patientInfo.value?.uid);
-				if (patientIndex !== -1) {
-					patients[patientIndex].consulted = true;
-					localStorage.setItem('patientData', JSON.stringify(patients));
-				}
-			}
-		} catch (e) {
-			console.error('Failed to update patient consultation status', e);
-		}
-	}
-	
-	scrollToBottom(500);
+	if (session.locking || !textInput.value.trim()) return;
+	session.put(true, patientInfo.value?.name || '就诊人', '', textInput.value.trim());
 	textInput.value = '';
+	scrollToBottom(500);
 }
 
 function requestFileBrowser() {
@@ -462,6 +411,7 @@ async function uploadExamination() {
 	}
 
 	await PostExamination(session, list[0]);
+	browser.value.value = '';
 }
 
 import { GenerateReport } from 'src/adaptor/GenerateReport';

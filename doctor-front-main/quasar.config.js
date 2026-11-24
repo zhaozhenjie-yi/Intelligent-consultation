@@ -55,6 +55,7 @@ module.exports = configure(function (/* ctx */) {
 		// Full list of options: https://v2.quasar.dev/quasar-cli-vite/quasar-config-js#build
 		build: {
 			env: {
+				API_BASE_URL: process.env.API_BASE_URL || localSettings.API_BASE_URL || '/api',
 				PATIENT_MANAGEMENT_PASSWORD: process.env.PATIENT_MANAGEMENT_PASSWORD || localSettings.PATIENT_MANAGEMENT_PASSWORD || '',
 			},
 			target: {
@@ -101,8 +102,11 @@ module.exports = configure(function (/* ctx */) {
 
 		// Full list of options: https://v2.quasar.dev/quasar-cli-vite/quasar-config-js#devServer
 		devServer: {
+			host: '127.0.0.1',
+			port: 8504,
+			proxy: { '/api': { target: process.env.API_PROXY_TARGET || 'http://127.0.0.1:8503', changeOrigin: true, xfwd: true } },
 			// https: true
-			open: true, // opens browser window automatically
+			open: false, // opens browser window automatically
 		},
 
 		// https://v2.quasar.dev/quasar-cli-vite/quasar-config-js#framework

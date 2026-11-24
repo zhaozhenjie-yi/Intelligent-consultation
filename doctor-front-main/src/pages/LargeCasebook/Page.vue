@@ -10,6 +10,9 @@
 				style="min-width: 720px; max-width: 840px"
 				padding
 			>
+				<q-banner v-if="loading">正在读取病历……</q-banner>
+				<q-banner v-else-if="loadError" class="bg-red-1">{{ loadError }}<q-btn flat label="重试" @click="loadCasebook" /></q-banner>
+				<q-btn v-else label="下载完整病历" :href="downloadUrl" />
 				<div
 					id="heading"
 					class="flex justify-between q-pb-md"
@@ -42,13 +45,13 @@
 						<span class="text-grey-6">科室：</span>{{ casebook.class }}
 					</div>
 					<div id="code">
-						<span class="text-grey-6">住院号：</span>{{ casebook.code }}
+						<span class="text-grey-6">病历号：</span>{{ casebook.code }}
 					</div>
 				</div>
 
 				<div class="row q-col-gutter-sm">
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="compact-form-input"
 							outlined
 							dense
@@ -57,7 +60,7 @@
 						></q-input>
 					</div>
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="compact-form-input"
 							outlined
 							dense
@@ -66,7 +69,7 @@
 						></q-input>
 					</div>
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="compact-form-input"
 							outlined
 							dense
@@ -78,7 +81,7 @@
 
 				<div class="row q-col-gutter-sm q-mt-sm">
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							dense
 							label="民族"
@@ -86,7 +89,7 @@
 						></q-input>
 					</div>
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							dense
 							label="婚姻状况"
@@ -94,7 +97,7 @@
 						></q-input>
 					</div>
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							dense
 							label="籍贯"
@@ -102,7 +105,7 @@
 						></q-input>
 					</div>
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							dense
 							label="电话"
@@ -110,7 +113,7 @@
 						></q-input>
 					</div>
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							dense
 							label="可靠程度"
@@ -121,7 +124,7 @@
 
 				<div class="row q-col-gutter-sm q-mt-sm">
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							stack-label
 							dense
@@ -131,7 +134,7 @@
 						></q-input>
 					</div>
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							stack-label
 							dense
@@ -144,7 +147,7 @@
 
 				<div class="row q-col-gutter-sm q-mt-sm">
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							dense
 							label="住址"
@@ -155,7 +158,7 @@
 
 				<div class="row q-col-gutter-sm q-mt-sm">
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							dense
 							label="入院日期"
@@ -163,7 +166,7 @@
 						></q-input>
 					</div>
 					<div class="col">
-						<q-input
+						<q-input readonly
 							class="classical-form-input"
 							dense
 							label="病历采写日期"
@@ -187,40 +190,31 @@
 					</div>
 				</div>
 
-				<symptom-item
+				<q-input readonly autogrow type="textarea" outlined
 					name="issue"
 					class="q-mt-lg"
 					label="患者主诉："
-					:value="casebook.symptom.issue"
+					:model-value="casebook.symptom.issue"
 				/>
 
-				<symptom-item
+				<q-input readonly autogrow type="textarea" outlined
 					name="current"
 					class="q-mt-sm"
 					label="现病史："
-					:value="casebook.symptom.current"
+					:model-value="casebook.symptom.current"
 				/>
 
-				<symptom-item
+				<q-input readonly autogrow type="textarea" outlined
 					name="history"
 					class="q-mt-sm"
 					label="既往史："
-					:value="casebook.symptom.history"
+					:model-value="casebook.symptom.history"
 				/>
 
 				<div class="row symptom-item q-pa-sm q-mt-sm">
 					<div class="col-2 text-weight-bold">
 						<div>体格检查：</div>
-						<q-btn
-							:icon="listening === null ? 'mic' : 'hearing'"
-							dense
-							outline
-							size="sm"
-							:color="listening === null ? 'grey-6' : 'red'"
-							class="bg-grey-1"
-							@mousedown.stop="requestRecord"
-							@mouseup.stop="cancelRecord"
-						></q-btn>
+
 					</div>
 
 					<div class="col row q-col-gutter-sm">
@@ -239,59 +233,39 @@
 </template>
 
 <script setup lang="ts">
-import { reactive, ref } from 'vue';
+import { reactive, ref, onMounted } from 'vue';
 import { date } from 'quasar';
-
-import SymptomItem from './SymptomItem.vue';
 import IndexItem from './IndexItem.vue';
-import { Recorder } from './IndexRecorder';
-import casebook from './sample/profile.json';
+import { Casebook } from 'src/model/Casebook';
+import { FetchCasebookData } from 'src/adaptor/FetchCasebookData';
+import { getUserId } from 'src/adaptor/User';
+import { errorMessage, API_BASE_URL } from 'src/adaptor/Api';
 
-const MASK = 'YYYY-MM-DD HH:mm';
-
-function toLocalString(isoString: string) {
-	return date.formatDate(new Date(isoString).getTime(), MASK);
+const uid = getUserId();
+const loading = ref(true);
+const loadError = ref('');
+const downloadUrl = `${API_BASE_URL}/download_report?uid=${encodeURIComponent(uid)}`;
+const casebook = reactive({
+	class: '泌尿外科', code: '未登记',
+	profile: { name: '', sex: '', age: '', family: '不详', marriage: '不详', registry: '不详', phone: '不详', reliable: '不详', job: '不详', employer: '不详', address: '不详', createdAt: '', recordedAt: '' },
+	symptom: { issue: '', current: '', history: '' },
+});
+const INDEX_LIST = [{ name: 'heat', label: '体温（℃）' }, { name: 'pulse', label: '心率（次/分）' }, { name: 'breathe', label: '呼吸（次/分）' }, { name: 'pressure', label: '血压（mmHg）' }];
+const indexes: Record<string, string> = { heat: '未提供', pulse: '未提供', breathe: '未提供', pressure: '未提供' };
+function toLocalString(value: string) { return value ? date.formatDate(value, 'YYYY-MM-DD HH:mm') : '不详'; }
+async function loadCasebook() {
+	loading.value = true; loadError.value = '';
+	try {
+		const model = new Casebook();
+		const patient = await FetchCasebookData(model);
+		casebook.code = patient.medical_record_number || '未登记';
+		const data = model.data;
+		Object.assign(casebook.profile, { name: data.profile.name || '不详', age: data.profile.age === null ? '不详' : `${data.profile.age}岁`, sex: ['', '男', '女'][data.profile.gender] || '不详' });
+		Object.assign(casebook.symptom, { issue: data.chiefComplaint || '不详', current: data.history.present || '不详', history: data.history.past || '不详' });
+	} catch (error) { loadError.value = errorMessage(error); }
+	finally { loading.value = false; }
 }
-
-interface IndexRecord {
-	heat: string;
-	pulse: string;
-	breathe: string;
-	pressure: string;
-}
-
-const INDEX_LIST: {
-	name: keyof IndexRecord;
-	label: string;
-}[] = [
-	{ name: 'heat', label: '体温（℃）' },
-	{ name: 'pulse', label: '心率（次/分）' },
-	{ name: 'breathe', label: '呼吸（次/分）' },
-	{ name: 'pressure', label: '血压（mmHg）' },
-];
-
-const indexes = reactive<IndexRecord>({ ...casebook.index });
-const listening = ref<Recorder | null>(null);
-
-async function requestRecord() {
-	const recorder = (listening.value = new Recorder());
-
-	recorder.addEventListener('finish', () => {
-		indexes[recorder.name as keyof IndexRecord] = recorder.text as string;
-	});
-
-	await recorder.start();
-}
-
-async function cancelRecord() {
-	if (listening.value !== null) {
-		const recorder = listening.value;
-
-		await recorder.stop(true);
-	}
-
-	listening.value = null;
-}
+onMounted(loadCasebook);
 defineOptions({ name: 'Page.LargeCasebook' });
 </script>
 

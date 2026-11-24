@@ -399,7 +399,7 @@ interface Patient {
 }
 
 // 定义API基础URL - 使用完整的URL，不要使用相对路径
-const API_BASE_URL = 'http://127.0.0.1:8503/api';
+import { API_BASE_URL } from 'src/adaptor/Api';
 // 打印API基础URL用于调试
 console.log('API基础URL:', API_BASE_URL);
 

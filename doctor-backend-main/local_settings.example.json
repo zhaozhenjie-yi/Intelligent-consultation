@@ -8,5 +8,19 @@
   "MODEL_API_KEY_1": "",
   "ELASTICSEARCH_URL": "",
   "ELASTICSEARCH_USERNAME": "",
-  "ELASTICSEARCH_PASSWORD": ""
+  "ELASTICSEARCH_PASSWORD": "",
+  "QA_BASE_URL": "https://api.deepseek.com/v1",
+  "QA_MODEL": "deepseek-chat",
+  "QA_API_KEY": "",
+  "REPORT_BASE_URL": "https://api.deepseek.com/v1",
+  "REPORT_MODEL": "deepseek-chat",
+  "REPORT_API_KEY": "",
+  "JSON_BASE_URL": "https://api.deepseek.com/v1",
+  "JSON_MODEL": "deepseek-chat",
+  "JSON_API_KEY": "",
+  "AUDIO_BASE_URL": "",
+  "AUDIO_API_KEY": "",
+  "AUDIO_MODEL": "whisper-1",
+  "DATA_DIR": "",
+  "FRONTEND_URL": ""
 }

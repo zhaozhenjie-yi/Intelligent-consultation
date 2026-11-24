@@ -1,3 +1,4 @@
+import { getUserId } from 'src/adaptor/User';
 import { OnSessionCreated, SpeechToText } from 'src/adaptor/InteractionSession';
 
 export class Recorder extends EventTarget {
@@ -21,18 +22,18 @@ export class Recorder extends EventTarget {
 	#reserved = false;
 	#recorder: MediaRecorder | null = null;
 	#resolve: (value?: unknown) => void = () => {};
+	#reject: (reason?: unknown) => void = () => {};
 
 	async start() {
 		if (this.#recording) {
 			throw new Error('It is recording.');
 		}
 
-		this.#recording = true;
-
 		const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 		const recorder = (this.#recorder = new MediaRecorder(stream, {
 			mimeType: 'audio/webm',
 		}));
+		this.#recording = true;
 		const chunks: Blob[] = [];
 
 		const textSetter = (text: string) => {
@@ -40,15 +41,18 @@ export class Recorder extends EventTarget {
 		};
 
 		recorder.addEventListener('stop', async () => {
-			if (this.#reserved) {
-				const blob = new Blob(chunks, { type: 'audio/webm' });
-
-				this.setAudio(blob);
-				await SpeechToText(blob, textSetter);
+			stream.getTracks().forEach((track) => track.stop());
+			try {
+				if (this.#reserved) {
+					const blob = new Blob(chunks, { type: 'audio/webm' });
+					this.setAudio(blob);
+					await SpeechToText(blob, textSetter);
+					this.end();
+				}
+				this.#resolve();
+			} catch (error) {
+				this.#reject(error);
 			}
-
-			this.#resolve();
-			this.end();
 		});
 
 		recorder.addEventListener('dataavailable', (event) => {
@@ -65,7 +69,9 @@ export class Recorder extends EventTarget {
 
 		this.#reserved = reserved;
 
-		return new Promise((resolve) => {
+		return new Promise((resolve, reject) => {
+			this.#resolve = resolve;
+			this.#reject = reject;
 			if (this.#recorder !== null) {
 				this.#recorder.stop();
 			}
@@ -110,6 +116,7 @@ export class RecorderEvent extends Event {
 }
 
 export class Session extends EventTarget {
+	readonly uid = getUserId();
 	#attachments: { [key: string]: Attachment } = {};
 
 	attach(key: string, resource: Attachment) {
@@ -143,7 +150,7 @@ export class Session extends EventTarget {
 		const recorder = (event.recorder = new Recorder());
 
 		recorder.addEventListener('finish', () => {
-			this.put(false, who, URL.createObjectURL(recorder.audio), recorder.text);
+			this.put(false, who, '', recorder.text || '');
 		});
 
 		this.dispatchEvent(event);
@@ -158,7 +165,7 @@ export class Session extends EventTarget {
 		this.dispatchEvent(event);
 
 		recorder.addEventListener('finish', () => {
-			this.put(true, who, URL.createObjectURL(recorder.audio), recorder.text);
+			this.put(true, who, recorder.audio?.size ? URL.createObjectURL(recorder.audio) : '', recorder.text || '');
 		});
 
 		return recorder;
